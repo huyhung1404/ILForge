@@ -13,11 +13,11 @@ namespace Unity.ILForge.CodeGen
 {
     public class WiredWeaver : ILPostProcessor
     {
-        private static HashSet<string> allowedAssemblies;
-        private const string configPath = "Assets/Editor/WeaverAssemblies.txt";
-        private static readonly Type serviceAttributeType = typeof(ServiceAttribute);
-        private static readonly Type wiredAttributeType = typeof(WiredAttribute);
-        private static readonly Type afterWiredAttributeType = typeof(AfterWiredAttribute);
+        private const string k_configPath = "Assets/Editor/WeaverAssemblies.txt";
+        private static HashSet<string> _allowedAssemblies;
+        private static readonly Type _serviceAttributeType = typeof(ServiceAttribute);
+        private static readonly Type _wiredAttributeType = typeof(WiredAttribute);
+        private static readonly Type _afterWiredAttributeType = typeof(AfterWiredAttribute);
 
         private class ServiceEntry
         {
@@ -27,22 +27,22 @@ namespace Unity.ILForge.CodeGen
 
         private static void LoadAssemblyList()
         {
-            if (allowedAssemblies != null) return;
+            if (_allowedAssemblies != null) return;
 
-            allowedAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _allowedAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            if (!File.Exists(configPath))
+            if (!File.Exists(k_configPath))
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(configPath) ?? string.Empty);
-                File.WriteAllText(configPath, "Assembly-CSharp");
+                Directory.CreateDirectory(Path.GetDirectoryName(k_configPath) ?? string.Empty);
+                File.WriteAllText(k_configPath, "Assembly-CSharp");
                 return;
             }
 
-            foreach (var line in File.ReadAllLines(configPath))
+            foreach (var line in File.ReadAllLines(k_configPath))
             {
                 var name = line.Trim();
                 if (!string.IsNullOrEmpty(name))
-                    allowedAssemblies.Add(name);
+                    _allowedAssemblies.Add(name);
             }
         }
 
@@ -51,7 +51,7 @@ namespace Unity.ILForge.CodeGen
         public override bool WillProcess(ICompiledAssembly asm)
         {
             LoadAssemblyList();
-            return allowedAssemblies.Contains(asm.Name);
+            return _allowedAssemblies.Contains(asm.Name);
         }
 
         public override ILPostProcessResult Process(ICompiledAssembly asm)
@@ -78,7 +78,7 @@ namespace Unity.ILForge.CodeGen
             {
                 foreach (var method in type.Methods)
                 {
-                    var attr = method.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == serviceAttributeType.FullName);
+                    var attr = method.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _serviceAttributeType.FullName);
 
                     if (attr == null) continue;
 
@@ -123,7 +123,7 @@ namespace Unity.ILForge.CodeGen
             {
                 foreach (var method in type.Methods)
                 {
-                    if (method.CustomAttributes.All(a => a.AttributeType.FullName != serviceAttributeType.FullName)) continue;
+                    if (method.CustomAttributes.All(a => a.AttributeType.FullName != _serviceAttributeType.FullName)) continue;
 
                     if (!method.HasBody) continue;
 
@@ -177,7 +177,7 @@ namespace Unity.ILForge.CodeGen
         public void ProcessType(TypeDefinition type, ModuleDefinition module, List<DiagnosticMessage> diagnostics)
         {
             var wiredFields = type.Fields
-                .Where(f => f.CustomAttributes.Any(a => a.AttributeType.FullName == wiredAttributeType.FullName))
+                .Where(f => f.CustomAttributes.Any(a => a.AttributeType.FullName == _wiredAttributeType.FullName))
                 .ToList();
 
             if (wiredFields.Count == 0) return;
@@ -186,7 +186,7 @@ namespace Unity.ILForge.CodeGen
             InjectFieldsIntoMethod(wiredFields, initWiredMethod, module, diagnostics);
 
             var afterMethods = type.Methods
-                .Where(m => m.CustomAttributes.Any(a => a.AttributeType.FullName == afterWiredAttributeType.FullName))
+                .Where(m => m.CustomAttributes.Any(a => a.AttributeType.FullName == _afterWiredAttributeType.FullName))
                 .ToList();
 
             if (afterMethods.Count > 0)
@@ -286,7 +286,7 @@ namespace Unity.ILForge.CodeGen
         private static string BuildFieldNameFromField(FieldDefinition field, ModuleDefinition module)
         {
             var wiredAttr = field.CustomAttributes
-                .FirstOrDefault(a => a.AttributeType.FullName == wiredAttributeType.FullName);
+                .FirstOrDefault(a => a.AttributeType.FullName == _wiredAttributeType.FullName);
 
             TypeReference scopeType = null;
 
@@ -314,7 +314,7 @@ namespace Unity.ILForge.CodeGen
 
         private static string BuildFieldNameFromTypeAndScope(TypeReference paramType, MethodDefinition method, ModuleDefinition module)
         {
-            var attr = method.CustomAttributes.First(a => a.AttributeType.FullName == serviceAttributeType.FullName);
+            var attr = method.CustomAttributes.First(a => a.AttributeType.FullName == _serviceAttributeType.FullName);
 
             TypeReference scopeType = null;
 

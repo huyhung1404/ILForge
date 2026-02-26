@@ -5,7 +5,7 @@ namespace ILForge
     [AttributeUsage(AttributeTargets.Method)]
     public class ServiceAttribute : Attribute
     {
-        public Type ScopeType;
+        public Type ScopeType { get; private set; }
 
         public ServiceAttribute(Type scopeType = null)
         {

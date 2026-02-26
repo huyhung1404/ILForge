@@ -12,9 +12,9 @@ namespace Unity.ILForge.CodeGen.Helpers
     internal class PostProcessorAssemblyResolver : IAssemblyResolver
     {
         private readonly string[] _referenceDirectories;
-        private Dictionary<string, HashSet<string>> _referenceToPathMap;
-        Dictionary<string, AssemblyDefinition> _cache = new Dictionary<string, AssemblyDefinition>();
-        private ICompiledAssembly _compiledAssembly;
+        private readonly Dictionary<string, HashSet<string>> _referenceToPathMap;
+        private readonly Dictionary<string, AssemblyDefinition> _cache = new Dictionary<string, AssemblyDefinition>();
+        private readonly ICompiledAssembly _compiledAssembly;
         private AssemblyDefinition _selfAssembly;
 
         public PostProcessorAssemblyResolver(ICompiledAssembly compiledAssembly)

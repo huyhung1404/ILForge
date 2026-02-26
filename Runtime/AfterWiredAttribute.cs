@@ -5,7 +5,7 @@ namespace ILForge
     [AttributeUsage(AttributeTargets.Method)]
     public class AfterWiredAttribute : Attribute
     {
-        public int Order;
+        public int Order { get; private set; }
 
         public AfterWiredAttribute(int order = 0)
         {
