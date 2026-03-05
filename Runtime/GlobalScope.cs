@@ -1,6 +1,10 @@
 ﻿namespace ILForge
 {
-    public sealed class GlobalScope
+    public abstract class Scope
+    {
+    }
+
+    public sealed class GlobalScope : Scope
     {
     }
 }

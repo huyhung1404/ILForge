@@ -13,11 +13,12 @@ namespace Unity.ILForge.CodeGen
 {
     public class WiredWeaver : ILPostProcessor
     {
-        private const string k_configPath = "Assets/Editor/WeaverAssemblies.txt";
-        private static HashSet<string> _allowedAssemblies;
-        private static readonly Type _serviceAttributeType = typeof(ServiceAttribute);
-        private static readonly Type _wiredAttributeType = typeof(WiredAttribute);
-        private static readonly Type _afterWiredAttributeType = typeof(AfterWiredAttribute);
+        private const string k_configPath = "ProjectSettings/ILForge_CompilerSettings.txt";
+        private const string k_codeGenClassName = "ILForge_Generate";
+
+        private readonly Type _serviceAttributeType = typeof(ServiceAttribute);
+        private readonly Type _wiredAttributeType = typeof(WiredAttribute);
+        private readonly Type _afterWiredAttributeType = typeof(AfterWiredAttribute);
 
         private class ServiceEntry
         {
@@ -25,33 +26,30 @@ namespace Unity.ILForge.CodeGen
             public string FieldName;
         }
 
-        private static void LoadAssemblyList()
+        private class WiredTarget
         {
-            if (_allowedAssemblies != null) return;
-
-            _allowedAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            if (!File.Exists(k_configPath))
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(k_configPath) ?? string.Empty);
-                File.WriteAllText(k_configPath, "Assembly-CSharp");
-                return;
-            }
-
-            foreach (var line in File.ReadAllLines(k_configPath))
-            {
-                var name = line.Trim();
-                if (!string.IsNullOrEmpty(name))
-                    _allowedAssemblies.Add(name);
-            }
+            public FieldDefinition BackingField;
+            public TypeReference ScopeType;
+            public string OriginalName;
         }
 
         public override ILPostProcessor GetInstance() => this;
 
         public override bool WillProcess(ICompiledAssembly asm)
         {
-            LoadAssemblyList();
-            return _allowedAssemblies.Contains(asm.Name);
+            if (!File.Exists(k_configPath)) return false;
+
+            var lines = File.ReadAllLines(k_configPath);
+            if (lines.Length == 0) return false;
+
+            if (!bool.TryParse(lines[0], out var isEnabled) || !isEnabled) return false;
+
+            for (var i = 1; i < lines.Length; i++)
+            {
+                if (string.Equals(lines[i], asm.Name, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+
+            return false;
         }
 
         public override ILPostProcessResult Process(ICompiledAssembly asm)
@@ -60,17 +58,36 @@ namespace Unity.ILForge.CodeGen
             var assembly = CodeGenHelpers.AssemblyDefinitionFor(asm);
             var module = assembly.MainModule;
 
-            var services = CollectServices(module);
-
+            var services = CollectServices(module, diagnostics);
             GenerateCodeInAssembly(services, module);
             InjectServiceBindings(module, diagnostics);
 
-            foreach (var type in module.Types) ProcessType(type, module, diagnostics);
+            var allTypes = new List<TypeDefinition>();
+            foreach (var type in module.Types)
+            {
+                allTypes.Add(type);
+                CollectNestedTypes(type, allTypes);
+            }
+
+            foreach (var type in allTypes)
+            {
+                ProcessType(type, module, diagnostics);
+            }
 
             return CodeGenHelpers.GetResult(assembly, diagnostics);
         }
 
-        private static List<ServiceEntry> CollectServices(ModuleDefinition module)
+        private void CollectNestedTypes(TypeDefinition parentType, List<TypeDefinition> allTypes)
+        {
+            if (!parentType.HasNestedTypes) return;
+            foreach (var nestedType in parentType.NestedTypes)
+            {
+                allTypes.Add(nestedType);
+                CollectNestedTypes(nestedType, allTypes);
+            }
+        }
+
+        private List<ServiceEntry> CollectServices(ModuleDefinition module, List<DiagnosticMessage> diagnostics)
         {
             var services = new List<ServiceEntry>();
 
@@ -79,44 +96,41 @@ namespace Unity.ILForge.CodeGen
                 foreach (var method in type.Methods)
                 {
                     var attr = method.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _serviceAttributeType.FullName);
-
                     if (attr == null) continue;
 
                     var scopeType = attr.ConstructorArguments.Count > 0
                         ? (TypeReference)attr.ConstructorArguments[0].Value
-                        : null;
+                        : module.ImportReference(typeof(GlobalScope));
 
-                    var scopeName = scopeType != null
-                        ? scopeType.Name.Replace("Scope", "")
-                        : "Global";
+                    var scopeName = scopeType.Name.Replace("Scope", "");
 
-                    services.AddRange(from p in method.Parameters
-                                      let typeName = p.ParameterType.FullName
-                                          .Replace(".", "_")
-                                          .Replace("/", "_")
-                                          .Replace("<", "_")
-                                          .Replace(">", "_")
-                                          .Replace("`", "_")
-                                          .Replace("[", "_")
-                                          .Replace("]", "_")
-                                          .Replace(",", "_")
-                                      select new ServiceEntry { ParamType = p.ParameterType, FieldName = $"{scopeName}_{typeName}" });
+                    foreach (var p in method.Parameters)
+                    {
+                        if (p.ParameterType.IsGenericParameter)
+                        {
+                            diagnostics.AddError(method, $"Cannot wire unbound generic parameter '{p.ParameterType.Name}' in '{method.Name}'.");
+                            continue;
+                        }
+
+                        var typeName = FormatTypeName(p.ParameterType);
+                        services.Add(new ServiceEntry { ParamType = p.ParameterType, FieldName = $"{scopeName}_{typeName}" });
+                    }
                 }
             }
 
             return services;
         }
 
-        private static void GenerateCodeInAssembly(List<ServiceEntry> services, ModuleDefinition module)
+        private void GenerateCodeInAssembly(List<ServiceEntry> services, ModuleDefinition module)
         {
             if (services.Count == 0) return;
             var codeGen = GetOrCreateCodeGenerate(module);
             foreach (var s in services) AddServiceField(codeGen, s.ParamType, s.FieldName, module);
         }
 
-        private static void InjectServiceBindings(ModuleDefinition module, List<DiagnosticMessage> diagnostics)
+        private void InjectServiceBindings(ModuleDefinition module, List<DiagnosticMessage> diagnostics)
         {
-            var codeGen = module.Types.FirstOrDefault(t => t.Name == "ILForge_Generate");
+            var codeGen = module.Types.FirstOrDefault(t => t.Name == k_codeGenClassName);
             if (codeGen == null) return;
 
             foreach (var type in module.Types)
@@ -124,7 +138,6 @@ namespace Unity.ILForge.CodeGen
                 foreach (var method in type.Methods)
                 {
                     if (method.CustomAttributes.All(a => a.AttributeType.FullName != _serviceAttributeType.FullName)) continue;
-
                     if (!method.HasBody) continue;
 
                     var il = method.Body.GetILProcessor();
@@ -132,8 +145,11 @@ namespace Unity.ILForge.CodeGen
 
                     foreach (var p in method.Parameters)
                     {
+                        if (p.ParameterType.IsGenericParameter) continue;
+
                         var fieldName = BuildFieldNameFromTypeAndScope(p.ParameterType, method, module);
                         var holderField = codeGen.Fields.FirstOrDefault(f => f.Name == fieldName);
+
                         if (holderField == null)
                         {
                             diagnostics.AddError(method, $"Failed to inject service '{p.ParameterType.Name}' into '{method.Name}'. Field not found.");
@@ -147,103 +163,249 @@ namespace Unity.ILForge.CodeGen
             }
         }
 
-        private static TypeDefinition GetOrCreateCodeGenerate(ModuleDefinition module)
+        private TypeDefinition GetOrCreateCodeGenerate(ModuleDefinition module)
         {
-            var type = module.Types.FirstOrDefault(t => t.Name == "ILForge_Generate");
+            var type = module.Types.FirstOrDefault(t => t.Name == k_codeGenClassName);
             if (type != null) return type;
 
-            type = new TypeDefinition(
-                "",
-                "ILForge_Generate",
-                TypeAttributes.NotPublic | TypeAttributes.Abstract | TypeAttributes.Sealed,
-                module.TypeSystem.Object);
-
+            type = new TypeDefinition("", k_codeGenClassName, TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed, module.TypeSystem.Object);
             module.Types.Add(type);
             return type;
         }
 
-        private static void AddServiceField(TypeDefinition codeGen, TypeReference paramType, string fieldName, ModuleDefinition module)
+        private void AddServiceField(TypeDefinition codeGen, TypeReference paramType, string fieldName, ModuleDefinition module)
         {
             if (codeGen.Fields.Any(f => f.Name == fieldName)) return;
 
-            var field = new FieldDefinition(
-                fieldName,
-                FieldAttributes.Public | FieldAttributes.Static,
-                module.ImportReference(paramType));
-
+            var field = new FieldDefinition(fieldName, FieldAttributes.Public | FieldAttributes.Static, module.ImportReference(paramType));
             codeGen.Fields.Add(field);
         }
 
         public void ProcessType(TypeDefinition type, ModuleDefinition module, List<DiagnosticMessage> diagnostics)
         {
-            var wiredFields = type.Fields
-                .Where(f => f.CustomAttributes.Any(a => a.AttributeType.FullName == _wiredAttributeType.FullName))
-                .ToList();
+            var wiredTargets = new List<WiredTarget>();
 
-            if (wiredFields.Count == 0) return;
-
-            var initWiredMethod = GetOrCreateInitWired(type, module);
-            InjectFieldsIntoMethod(wiredFields, initWiredMethod, module, diagnostics);
-
-            var afterMethods = type.Methods
-                .Where(m => m.CustomAttributes.Any(a => a.AttributeType.FullName == _afterWiredAttributeType.FullName))
-                .ToList();
-
-            if (afterMethods.Count > 0)
+            foreach (var field in type.Fields)
             {
-                foreach (var method in afterMethods)
+                var attr = field.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _wiredAttributeType.FullName);
+                if (attr == null) continue;
+
+                if (field.IsStatic)
                 {
-                    InjectMethodCall(method, initWiredMethod, module);
+                    diagnostics.AddError(type.Methods.FirstOrDefault(), $"[Wired] cannot be used on static field '{field.Name}' in '{type.Name}'.");
+                    continue;
                 }
-            }
-            else
-            {
-                // Only inject into Awake if it's a MonoBehaviour. Otherwise, warn or just skip.
-                if (IsMonoBehaviour(type))
+
+                if (field.FieldType.IsGenericParameter)
                 {
-                    var awake = GetOrCreateAwake(type, module);
-                    InjectMethodCall(awake, initWiredMethod, module);
+                    diagnostics.AddError(type.Methods.FirstOrDefault(), $"[Wired] cannot resolve unbound generic type '{field.FieldType.Name}' in '{type.Name}'.");
+                    continue;
+                }
+
+                field.Attributes &= ~FieldAttributes.InitOnly;
+                var scopeType = attr.ConstructorArguments.Count > 0 ? attr.ConstructorArguments[0].Value as TypeReference : module.ImportReference(typeof(GlobalScope));
+                wiredTargets.Add(new WiredTarget { BackingField = field, ScopeType = scopeType, OriginalName = field.Name });
+            }
+
+            foreach (var prop in type.Properties)
+            {
+                var attr = prop.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _wiredAttributeType.FullName);
+                if (attr == null) continue;
+
+                var backingField = type.Fields.FirstOrDefault(f => f.Name == $"<{prop.Name}>k__BackingField");
+                if (backingField != null)
+                {
+                    if (backingField.IsStatic)
+                    {
+                        diagnostics.AddError(type.Methods.FirstOrDefault(), $"[Wired] cannot be used on static property '{prop.Name}' in '{type.Name}'.");
+                        continue;
+                    }
+
+                    if (backingField.FieldType.IsGenericParameter)
+                    {
+                        diagnostics.AddError(type.Methods.FirstOrDefault(), $"[Wired] cannot resolve unbound generic type for property '{prop.Name}' in '{type.Name}'.");
+                        continue;
+                    }
+
+                    backingField.Attributes &= ~FieldAttributes.InitOnly;
+                    var scopeType = attr.ConstructorArguments.Count > 0 ? attr.ConstructorArguments[0].Value as TypeReference : module.ImportReference(typeof(GlobalScope));
+                    wiredTargets.Add(new WiredTarget { BackingField = backingField, ScopeType = scopeType, OriginalName = prop.Name });
                 }
                 else
                 {
-                    diagnostics.AddWarning(type.Methods.FirstOrDefault(), $"Class '{type.Name}' has [Wired] fields but is not a MonoBehaviour and has no [AfterWired] method. Dependencies will not be automatically injected.");
+                    diagnostics.AddWarning(type.Methods.FirstOrDefault(), $"Cannot wire property '{prop.Name}' in '{type.Name}'. Only auto-properties are supported.");
+                }
+            }
+
+            if (wiredTargets.Count == 0) return;
+
+            var initWiredMethod = GetOrCreateInitWired(type, module);
+            InjectFieldsIntoMethod(wiredTargets, initWiredMethod, module, diagnostics);
+
+            ProcessAfterWired(type, module, initWiredMethod, diagnostics);
+        }
+
+        private void ProcessAfterWired(TypeDefinition type, ModuleDefinition module, MethodDefinition initWiredMethod, List<DiagnosticMessage> diagnostics)
+        {
+            var afterMethods = new List<(MethodDefinition Method, int Order)>();
+
+            foreach (var method in type.Methods)
+            {
+                var attr = method.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _afterWiredAttributeType.FullName);
+                if (attr == null) continue;
+                
+                if (method.Parameters.Count > 0)
+                {
+                    diagnostics.AddError(method, $"[AfterWired] method '{method.Name}' in '{type.Name}' must not have any parameters.");
+                    continue;
+                }
+
+                var order = 0;
+                if (attr.ConstructorArguments.Count > 0 && attr.ConstructorArguments[0].Value is int orderValue) order = orderValue;
+                afterMethods.Add((method, order));
+            }
+
+            afterMethods.Sort((a, b) => a.Order.CompareTo(b.Order));
+
+            var executorMethod = GetOrCreateAfterWiredExecutor(type, module);
+            var il = executorMethod.Body.GetILProcessor();
+
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Call, initWiredMethod));
+
+            foreach (var target in afterMethods)
+            {
+                il.Append(il.Create(OpCodes.Ldarg_0));
+                il.Append(il.Create(OpCodes.Call, target.Method));
+
+                if (target.Method.ReturnType.FullName != "System.Void")
+                {
+                    il.Append(il.Create(OpCodes.Pop));
+                }
+            }
+
+            il.Append(il.Create(OpCodes.Ret));
+
+            if (IsMonoBehaviour(type))
+            {
+                var awake = GetOrCreateAwake(type, module);
+                InjectMethodCall(awake, executorMethod);
+            }
+            else
+            {
+                var ctors = type.Methods.Where(m => m.IsConstructor && !m.IsStatic).ToList();
+                if (ctors.Count == 0) return;
+
+                foreach (var ctor in ctors)
+                {
+                    InjectIntoConstructor(ctor, executorMethod);
                 }
             }
         }
 
-        private bool IsMonoBehaviour(TypeDefinition type)
+        private void InjectIntoConstructor(MethodDefinition ctor, MethodDefinition methodToCall)
         {
-            var baseType = type.BaseType;
-            while (baseType != null)
+            if (!ctor.HasBody) return;
+            var il = ctor.Body.GetILProcessor();
+
+            Instruction insertPoint = null;
+            var declaringType = ctor.DeclaringType;
+            var baseType = declaringType.BaseType;
+            var callsThisCtor = false;
+
+            foreach (var instruction in ctor.Body.Instructions)
             {
-                if (baseType.FullName == "UnityEngine.MonoBehaviour") return true;
+                if (instruction.OpCode != OpCodes.Call) continue;
 
-                var baseTypeDef = baseType.Resolve();
-                if (baseTypeDef == null) break;
-                baseType = baseTypeDef.BaseType;
+                var methodRef = instruction.Operand as MethodReference;
+                if (methodRef == null || methodRef.Name != ".ctor") continue;
+
+                var resolvedMethodType = methodRef.DeclaringType.Resolve();
+                var resolvedBaseType = baseType?.Resolve();
+
+                if (resolvedMethodType != null && resolvedMethodType.FullName == declaringType.FullName)
+                {
+                    callsThisCtor = true;
+                    break;
+                }
+
+                if (resolvedBaseType != null && resolvedMethodType != null &&
+                    resolvedMethodType.FullName == resolvedBaseType.FullName)
+                {
+                    insertPoint = instruction.Next;
+                    break;
+                }
             }
-            return false;
-        }
 
-        private static void InjectMethodCall(MethodDefinition targetMethod, MethodDefinition methodToCall, ModuleDefinition module)
-        {
-            if (!targetMethod.HasBody) return;
-            var il = targetMethod.Body.GetILProcessor();
+            if (callsThisCtor) return;
 
-            // To be totally safe with Evaluation Stack (esp in Constructors or MonoBehaviours where `base.Awake()` might be called),
-            // We should ensure that we push 'this' (Ldarg_0) and Call our method *right at the beginning*, 
-            // but if there are base constructor/method calls, doing it too early could sometimes corrupt the stack depending on the existing bytecode.
-            // For standard Awake methods, inserting at First() is generally safe unless it's an auto-generated Awake from our own code
-            // where we explicitly put base.Awake() first. 
-            Instruction insertPoint = targetMethod.Body.Instructions.First();
+            if (insertPoint == null)
+            {
+                if (declaringType.IsValueType)
+                {
+                    insertPoint = ctor.Body.Instructions.First();
+                }
+                else
+                {
+                    return;
+                }
+            }
 
-            // If this Awake was just auto-generated by us and has a base.Awake call, we'll insert AFTER the base call (which is instruction 2, since 0 is ldarg.0 and 1 is Call base)
-            // But actually, it's safer to just insert at First() for everything, BECAUSE `ILForge_InitWired` doesn't consume anything from stack except `this`, and returns void.
             il.InsertBefore(insertPoint, il.Create(OpCodes.Ldarg_0));
             il.InsertBefore(insertPoint, il.Create(OpCodes.Call, methodToCall));
         }
 
-        private static MethodDefinition GetOrCreateInitWired(TypeDefinition type, ModuleDefinition module)
+        private FieldReference FindServiceField(ModuleDefinition currentModule, string fieldName)
+        {
+            var localCodeGen = currentModule.Types.FirstOrDefault(t => t.Name == k_codeGenClassName);
+            if (localCodeGen != null)
+            {
+                var localField = localCodeGen.Fields.FirstOrDefault(f => f.Name == fieldName);
+                if (localField != null) return localField;
+            }
+
+            foreach (var asmRef in currentModule.AssemblyReferences)
+            {
+                var resolvedAsm = currentModule.AssemblyResolver.Resolve(asmRef);
+                if (resolvedAsm == null) continue;
+
+                var refModule = resolvedAsm.MainModule;
+                var refCodeGen = refModule.Types.FirstOrDefault(t => t.Name == k_codeGenClassName);
+                if (refCodeGen == null) continue;
+
+                var refField = refCodeGen.Fields.FirstOrDefault(f => f.Name == fieldName);
+                if (refField == null) continue;
+
+                return currentModule.ImportReference(refField);
+            }
+
+            return null;
+        }
+
+        private void InjectFieldsIntoMethod(List<WiredTarget> targets, MethodDefinition method, ModuleDefinition module, List<DiagnosticMessage> diagnostics)
+        {
+            var il = method.Body.GetILProcessor();
+            var first = method.Body.Instructions.First();
+
+            foreach (var target in targets)
+            {
+                var holderFieldName = BuildFieldNameFromTarget(target);
+                var holderFieldRef = FindServiceField(module, holderFieldName);
+
+                if (holderFieldRef == null)
+                {
+                    diagnostics.AddError(method,
+                        $"Dependency not found for '{target.OriginalName}' in '{method.DeclaringType.Name}'. Missing [Service] in current or referenced assemblies.");
+                    continue;
+                }
+
+                il.InsertBefore(first, il.Create(OpCodes.Ldarg_0));
+                il.InsertBefore(first, il.Create(OpCodes.Ldsfld, holderFieldRef));
+                il.InsertBefore(first, il.Create(OpCodes.Stfld, target.BackingField));
+            }
+        }
+
+        private MethodDefinition GetOrCreateInitWired(TypeDefinition type, ModuleDefinition module)
         {
             var initMethod = type.Methods.FirstOrDefault(m => m.Name == "ILForge_InitWired");
             if (initMethod != null) return initMethod;
@@ -255,76 +417,48 @@ namespace Unity.ILForge.CodeGen
             return initMethod;
         }
 
-        private static void InjectFieldsIntoMethod(List<FieldDefinition> fields, MethodDefinition method, ModuleDefinition module, List<DiagnosticMessage> diagnostics)
+        private MethodDefinition GetOrCreateAfterWiredExecutor(TypeDefinition type, ModuleDefinition module)
         {
-            var codeGen = module.Types.FirstOrDefault(t => t.Name == "ILForge_Generate");
-            if (codeGen == null)
+            var executorMethod = type.Methods.FirstOrDefault(m => m.Name == "ILForge_ExecuteAfterWired");
+            if (executorMethod != null)
             {
-                diagnostics.AddError(method, $"Cannot inject [Wired] fields because no [Service] was found in the assembly.");
-                return;
+                executorMethod.Body.Instructions.Clear();
+                return executorMethod;
             }
 
-            var il = method.Body.GetILProcessor();
-            var first = method.Body.Instructions.First();
-
-            foreach (var field in fields)
-            {
-                var holderFieldName = BuildFieldNameFromField(field, module);
-                var holderField = codeGen.Fields.FirstOrDefault(f => f.Name == holderFieldName);
-                if (holderField == null)
-                {
-                    diagnostics.AddError(method, $"Dependency not found for [Wired] field '{field.Name}' in '{method.DeclaringType.Name}'. Missing [Service].");
-                    continue;
-                }
-
-                il.InsertBefore(first, il.Create(OpCodes.Ldarg_0));
-                il.InsertBefore(first, il.Create(OpCodes.Ldsfld, module.ImportReference(holderField)));
-                il.InsertBefore(first, il.Create(OpCodes.Stfld, field));
-            }
+            executorMethod = new MethodDefinition("ILForge_ExecuteAfterWired", MethodAttributes.Private, module.TypeSystem.Void);
+            type.Methods.Add(executorMethod);
+            return executorMethod;
         }
 
-        private static string BuildFieldNameFromField(FieldDefinition field, ModuleDefinition module)
+        private void InjectMethodCall(MethodDefinition targetMethod, MethodDefinition methodToCall)
         {
-            var wiredAttr = field.CustomAttributes
-                .FirstOrDefault(a => a.AttributeType.FullName == _wiredAttributeType.FullName);
+            if (!targetMethod.HasBody) return;
+            var il = targetMethod.Body.GetILProcessor();
+            var insertPoint = targetMethod.Body.Instructions.First();
+            il.InsertBefore(insertPoint, il.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(insertPoint, il.Create(OpCodes.Call, methodToCall));
+        }
 
-            TypeReference scopeType = null;
-
-            if (wiredAttr != null && wiredAttr.ConstructorArguments.Count > 0)
-            {
-                scopeType = wiredAttr.ConstructorArguments[0].Value as TypeReference;
-            }
-
-            scopeType ??= module.ImportReference(typeof(GlobalScope));
-
-            var scopeName = scopeType.Name.Replace("Scope", "");
-
-            var typeName = field.FieldType.FullName
-                .Replace(".", "_")
-                .Replace("/", "_")
-                .Replace("<", "_")
-                .Replace(">", "_")
-                .Replace("`", "_")
-                .Replace("[", "_")
-                .Replace("]", "_")
-                .Replace(",", "_");
-
+        private string BuildFieldNameFromTarget(WiredTarget target)
+        {
+            var scopeName = target.ScopeType.Name.Replace("Scope", "");
+            var typeName = FormatTypeName(target.BackingField.FieldType);
             return $"{scopeName}_{typeName}";
         }
 
-        private static string BuildFieldNameFromTypeAndScope(TypeReference paramType, MethodDefinition method, ModuleDefinition module)
+        private string BuildFieldNameFromTypeAndScope(TypeReference paramType, MethodDefinition method, ModuleDefinition module)
         {
             var attr = method.CustomAttributes.First(a => a.AttributeType.FullName == _serviceAttributeType.FullName);
+            var scopeType = attr.ConstructorArguments.Count > 0 ? attr.ConstructorArguments[0].Value as TypeReference : module.ImportReference(typeof(GlobalScope));
+            var scopeName = scopeType?.Name.Replace("Scope", "");
+            var typeName = FormatTypeName(paramType);
+            return $"{scopeName}_{typeName}";
+        }
 
-            TypeReference scopeType = null;
-
-            if (attr.ConstructorArguments.Count > 0) scopeType = attr.ConstructorArguments[0].Value as TypeReference;
-
-            scopeType ??= module.ImportReference(typeof(GlobalScope));
-
-            var scopeName = scopeType.Name.Replace("Scope", "");
-
-            var typeName = paramType.FullName
+        private static string FormatTypeName(TypeReference typeRef)
+        {
+            return typeRef.FullName
                 .Replace(".", "_")
                 .Replace("/", "_")
                 .Replace("<", "_")
@@ -333,23 +467,31 @@ namespace Unity.ILForge.CodeGen
                 .Replace("[", "_")
                 .Replace("]", "_")
                 .Replace(",", "_");
-
-            return $"{scopeName}_{typeName}";
         }
 
-        private static MethodDefinition GetOrCreateAwake(TypeDefinition type, ModuleDefinition module)
+        private bool IsMonoBehaviour(TypeDefinition type)
+        {
+            var baseType = type.BaseType;
+            while (baseType != null)
+            {
+                if (baseType.FullName == "UnityEngine.MonoBehaviour") return true;
+                var baseTypeDef = baseType.Resolve();
+                if (baseTypeDef == null) break;
+                baseType = baseTypeDef.BaseType;
+            }
+
+            return false;
+        }
+
+        private MethodDefinition GetOrCreateAwake(TypeDefinition type, ModuleDefinition module)
         {
             var awake = type.Methods.FirstOrDefault(m => m.Name == "Awake" && m.Parameters.Count == 0 && m.ReturnType.FullName == "System.Void");
             if (awake != null) return awake;
 
-            // Notice we make it Virtual and Protected if the class is unsealed and part of a hierarchy, but Private is fine for Unity magic methods if we don't care about strict OOP visiblity.
-            // Unity invokes Awake via reflection regardless of visibility, but making it Family (protected) or Private depends on base class.
-            // For safety, we will just use Family (protected) so subclasses can override it if they want to later.
             awake = new MethodDefinition("Awake", MethodAttributes.Family | MethodAttributes.HideBySig, module.TypeSystem.Void);
             type.Methods.Add(awake);
             var il = awake.Body.GetILProcessor();
 
-            // Try to find base.Awake() to call it (Looping up the hierarchy)
             var currentBaseType = type.BaseType;
             MethodDefinition baseAwake = null;
 
@@ -361,26 +503,21 @@ namespace Unity.ILForge.CodeGen
                 baseAwake = baseTypeDef.Methods.FirstOrDefault(m => m.Name == "Awake" && m.Parameters.Count == 0 && m.ReturnType.FullName == "System.Void");
                 if (baseAwake != null)
                 {
-                    // If we found a base Awake, our new Awake must be marked virtual if the base is virtual, or we just call it.
-                    if (baseAwake.IsVirtual)
-                    {
-                        awake.Attributes |= MethodAttributes.Virtual;
-                    }
+                    if (baseAwake.IsVirtual) awake.Attributes |= MethodAttributes.Virtual;
+                    if (baseAwake.IsPrivate) baseAwake = null;
+                    
                     break;
                 }
 
                 if (baseTypeDef.FullName == "UnityEngine.MonoBehaviour") break;
-
                 currentBaseType = baseTypeDef.BaseType;
             }
 
             var retInst = il.Create(OpCodes.Ret);
-
             if (baseAwake != null)
             {
-                var importedBaseAwake = module.ImportReference(baseAwake);
                 il.Append(il.Create(OpCodes.Ldarg_0));
-                il.Append(il.Create(OpCodes.Call, importedBaseAwake)); // Call (not Callvirt) to strictly call the base implementation
+                il.Append(il.Create(OpCodes.Call, module.ImportReference(baseAwake)));
             }
 
             il.Append(retInst);
