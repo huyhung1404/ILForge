@@ -143,6 +143,36 @@ This is useful when you need to control the exact moment injection occurs — fo
 
 **Restrictions:** Method must be an instance method with **no parameters** and must have a body.
 
+### `Resolver.Get<T>()`
+
+Manually retrieves a registered service at any point in your code. The weaver replaces the call with a direct static field load — zero allocation, zero reflection.
+
+```csharp
+using ILForge;
+
+public class DamageCalculator
+{
+    public float Calculate(float baseDamage)
+    {
+        var config = Resolver.Get<IGameConfig>();
+        return baseDamage * config.DamageMultiplier;
+    }
+}
+```
+
+With a custom scope:
+
+```csharp
+var spawner = Resolver.Get<GameplayScope, IEnemySpawner>();
+```
+
+This is useful when:
+- You need a service in a static method or utility class where `[Wired]` can't be used
+- You want to resolve a service lazily, only when needed
+- You need a service in a context where field injection isn't practical (lambdas, local functions, etc.)
+
+**How it works:** At compile time, `Resolver.Get<ILogger>()` is replaced by `ldsfld ILForge_Generate::Global_ILogger`. The method body (`return default`) never runs at runtime.
+
 ## Scopes
 
 By default, all services and wired fields use `GlobalScope`. You can create custom scopes to segment services into separate containers:
@@ -300,6 +330,25 @@ public class GameAnalytics
 // Usage:
 var analytics = new GameAnalytics(); // _logger is injected in the constructor
 analytics.TrackEvent("level_start");
+```
+
+```csharp
+// --- Manual resolve with Resolver.Get<T>() ---
+using ILForge;
+
+public static class DamageUtils
+{
+    public static float Calculate(float baseDamage, float armor)
+    {
+        // Resolver.Get works in static methods where [Wired] can't be used
+        var config = Resolver.Get<IGameConfig>();
+        var logger = Resolver.Get<ILogger>();
+
+        var result = (baseDamage - armor) * config.DamageMultiplier;
+        logger.Log($"Damage calculated: {result}");
+        return result;
+    }
+}
 ```
 
 ## License

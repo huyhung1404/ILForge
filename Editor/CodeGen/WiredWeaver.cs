@@ -16,6 +16,8 @@ namespace Unity.ILForge.CodeGen
         private const string k_configPath = "ProjectSettings/ILForge_CompilerSettings.txt";
         private const string k_codeGenClassName = "ILForge_Generate";
 
+        private const string k_resolverTypeFullName = "ILForge.Resolver";
+
         private readonly Type _serviceAttributeType = typeof(ServiceAttribute);
         private readonly Type _wiredAttributeType = typeof(WiredAttribute);
         private readonly Type _afterWiredAttributeType = typeof(AfterWiredAttribute);
@@ -74,6 +76,8 @@ namespace Unity.ILForge.CodeGen
             {
                 ProcessType(type, module, diagnostics);
             }
+
+            RewriteResolverCalls(allTypes, module, diagnostics);
 
             return CodeGenHelpers.GetResult(assembly, diagnostics);
         }
@@ -159,6 +163,56 @@ namespace Unity.ILForge.CodeGen
 
                         il.InsertBefore(first, il.Create(OpCodes.Ldarg, p));
                         il.InsertBefore(first, il.Create(OpCodes.Stsfld, module.ImportReference(holderField)));
+                    }
+                }
+            }
+        }
+
+        private void RewriteResolverCalls(List<TypeDefinition> allTypes, ModuleDefinition module, List<DiagnosticMessage> diagnostics)
+        {
+            foreach (var type in allTypes)
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (!method.HasBody) continue;
+
+                    var instructions = method.Body.Instructions;
+                    for (var i = 0; i < instructions.Count; i++)
+                    {
+                        var instruction = instructions[i];
+                        if (instruction.OpCode != OpCodes.Call) continue;
+                        if (instruction.Operand is not GenericInstanceMethod genericMethod) continue;
+                        if (genericMethod.DeclaringType.FullName != k_resolverTypeFullName) continue;
+                        if (genericMethod.Name != "Get") continue;
+
+                        TypeReference scopeType;
+                        TypeReference serviceType;
+
+                        if (genericMethod.GenericArguments.Count == 1)
+                        {
+                            scopeType = module.ImportReference(typeof(GlobalScope));
+                            serviceType = genericMethod.GenericArguments[0];
+                        }
+                        else if (genericMethod.GenericArguments.Count == 2)
+                        {
+                            scopeType = genericMethod.GenericArguments[0];
+                            serviceType = genericMethod.GenericArguments[1];
+                        }
+                        else continue;
+
+                        var scopeName = scopeType.Name.Replace("Scope", "");
+                        var fieldName = $"{scopeName}_{FormatTypeName(serviceType)}";
+                        var fieldRef = FindServiceField(module, fieldName);
+
+                        if (fieldRef == null)
+                        {
+                            diagnostics.AddError(method,
+                                $"Resolver.Get<{serviceType.Name}>() — no [Service] registered for '{serviceType.Name}' in scope '{scopeType.Name}'.");
+                            continue;
+                        }
+
+                        var il = method.Body.GetILProcessor();
+                        il.Replace(instruction, il.Create(OpCodes.Ldsfld, fieldRef));
                     }
                 }
             }
