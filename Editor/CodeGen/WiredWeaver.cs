@@ -99,8 +99,8 @@ namespace Unity.ILForge.CodeGen
                     var attr = method.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _serviceAttributeType.FullName);
                     if (attr == null) continue;
 
-                    var scopeType = attr.ConstructorArguments.Count > 0
-                        ? (TypeReference)attr.ConstructorArguments[0].Value
+                    var scopeType = attr.ConstructorArguments.Count > 0 && attr.ConstructorArguments[0].Value is TypeReference serviceScopeRef
+                        ? serviceScopeRef
                         : module.ImportReference(typeof(GlobalScope));
 
                     var scopeName = scopeType.Name.Replace("Scope", "");
@@ -204,7 +204,9 @@ namespace Unity.ILForge.CodeGen
                 }
 
                 field.Attributes &= ~FieldAttributes.InitOnly;
-                var scopeType = attr.ConstructorArguments.Count > 0 ? attr.ConstructorArguments[0].Value as TypeReference : module.ImportReference(typeof(GlobalScope));
+                var scopeType = attr.ConstructorArguments.Count > 0 && attr.ConstructorArguments[0].Value is TypeReference fieldScopeRef
+                    ? fieldScopeRef
+                    : module.ImportReference(typeof(GlobalScope));
                 wiredTargets.Add(new WiredTarget { BackingField = field, ScopeType = scopeType, OriginalName = field.Name });
             }
 
@@ -229,7 +231,9 @@ namespace Unity.ILForge.CodeGen
                     }
 
                     backingField.Attributes &= ~FieldAttributes.InitOnly;
-                    var scopeType = attr.ConstructorArguments.Count > 0 ? attr.ConstructorArguments[0].Value as TypeReference : module.ImportReference(typeof(GlobalScope));
+                    var scopeType = attr.ConstructorArguments.Count > 0 && attr.ConstructorArguments[0].Value is TypeReference propScopeRef
+                        ? propScopeRef
+                        : module.ImportReference(typeof(GlobalScope));
                     wiredTargets.Add(new WiredTarget { BackingField = backingField, ScopeType = scopeType, OriginalName = prop.Name });
                 }
                 else
@@ -492,8 +496,10 @@ namespace Unity.ILForge.CodeGen
         private string BuildFieldNameFromTypeAndScope(TypeReference paramType, MethodDefinition method, ModuleDefinition module)
         {
             var attr = method.CustomAttributes.First(a => a.AttributeType.FullName == _serviceAttributeType.FullName);
-            var scopeType = attr.ConstructorArguments.Count > 0 ? attr.ConstructorArguments[0].Value as TypeReference : module.ImportReference(typeof(GlobalScope));
-            var scopeName = scopeType?.Name.Replace("Scope", "");
+            var scopeType = attr.ConstructorArguments.Count > 0 && attr.ConstructorArguments[0].Value is TypeReference buildScopeRef
+                ? buildScopeRef
+                : module.ImportReference(typeof(GlobalScope));
+            var scopeName = scopeType.Name.Replace("Scope", "");
             var typeName = FormatTypeName(paramType);
             return $"{scopeName}_{typeName}";
         }
