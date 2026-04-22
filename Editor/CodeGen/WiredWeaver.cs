@@ -19,6 +19,7 @@ namespace Unity.ILForge.CodeGen
         private readonly Type _serviceAttributeType = typeof(ServiceAttribute);
         private readonly Type _wiredAttributeType = typeof(WiredAttribute);
         private readonly Type _afterWiredAttributeType = typeof(AfterWiredAttribute);
+        private readonly Type _wiredRegisterAttributeType = typeof(WiredRegisterAttribute);
 
         private class ServiceEntry
         {
@@ -286,7 +287,15 @@ namespace Unity.ILForge.CodeGen
 
             il.Append(il.Create(OpCodes.Ret));
 
-            if (IsMonoBehaviour(type))
+            var registerMethods = FindWiredRegisterMethods(type, diagnostics);
+            if (registerMethods.Count > 0)
+            {
+                foreach (var registerMethod in registerMethods)
+                {
+                    InjectMethodCall(registerMethod, executorMethod);
+                }
+            }
+            else if (IsMonoBehaviour(type))
             {
                 var awake = GetOrCreateAwake(type, module);
                 InjectMethodCall(awake, executorMethod);
@@ -301,6 +310,39 @@ namespace Unity.ILForge.CodeGen
                     InjectIntoConstructor(ctor, executorMethod);
                 }
             }
+        }
+
+        private List<MethodDefinition> FindWiredRegisterMethods(TypeDefinition type, List<DiagnosticMessage> diagnostics)
+        {
+            var results = new List<MethodDefinition>();
+
+            foreach (var method in type.Methods)
+            {
+                var attr = method.CustomAttributes.FirstOrDefault(a => a.AttributeType.FullName == _wiredRegisterAttributeType.FullName);
+                if (attr == null) continue;
+
+                if (method.IsStatic)
+                {
+                    diagnostics.AddError(method, $"[WiredRegister] cannot be used on static method '{method.Name}' in '{type.Name}'.");
+                    continue;
+                }
+
+                if (method.Parameters.Count > 0)
+                {
+                    diagnostics.AddError(method, $"[WiredRegister] method '{method.Name}' in '{type.Name}' must not have any parameters.");
+                    continue;
+                }
+
+                if (!method.HasBody)
+                {
+                    diagnostics.AddError(method, $"[WiredRegister] method '{method.Name}' in '{type.Name}' must have a body.");
+                    continue;
+                }
+
+                results.Add(method);
+            }
+
+            return results;
         }
 
         private void InjectIntoConstructor(MethodDefinition ctor, MethodDefinition methodToCall)
